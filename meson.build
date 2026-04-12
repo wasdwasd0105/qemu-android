@@ -1316,6 +1316,11 @@ if not get_option('sndio').auto() or have_system
                     method: 'pkg-config')
 endif
 
+aaudio = not_found
+if host_os == 'linux' and have_system
+  aaudio = cc.find_library('aaudio', required: false)
+endif
+
 spice_protocol = not_found
 if not get_option('spice_protocol').auto() or have_system
   spice_protocol = dependency('spice-protocol', version: '>=0.14.0',
@@ -2314,14 +2319,16 @@ if have_system
     'pipewire': pipewire.found(),
     'sdl': sdl.found(),
     'sndio': sndio.found(),
+    'aaudio': aaudio.found(),
   }
   foreach k, v: audio_drivers_available
     config_host_data.set('CONFIG_AUDIO_' + k.to_upper(), v)
   endforeach
 
   # Default to native drivers first, OSS second, SDL third
+  # aaudio is the native Android driver — prioritize it on Linux (Android)
   audio_drivers_priority = \
-    [ 'pa', 'coreaudio', 'dsound', 'sndio', 'oss' ] + \
+    [ 'aaudio', 'pa', 'coreaudio', 'dsound', 'sndio', 'oss' ] + \
     (host_os == 'linux' ? [] : [ 'sdl' ])
   audio_drivers_default = []
   foreach k: audio_drivers_priority

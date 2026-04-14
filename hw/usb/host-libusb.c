@@ -85,6 +85,7 @@ struct USBHostDevice {
     /* properties */
     struct USBAutoFilter             match;
     char                             *hostdevice;
+    int32_t                          hostfd_prop;
     int32_t                          bootindex;
     uint32_t                         iso_urb_count;
     uint32_t                         iso_urb_frames;
@@ -316,6 +317,42 @@ static int usb_host_init(void)
 #endif
     return 0;
 }
+
+#if LIBUSB_API_VERSION >= 0x0100010A && !defined(CONFIG_WIN32)
+static int usb_host_init_no_discovery(void)
+{
+    const struct libusb_pollfd **poll;
+    int rc;
+
+    if (ctx) {
+        return 0;
+    }
+    const struct libusb_init_option options[] = {
+        { .option = LIBUSB_OPTION_NO_DEVICE_DISCOVERY }
+    };
+    rc = libusb_init_context(&ctx, options, 1);
+    if (rc != 0) {
+        return -1;
+    }
+#if LIBUSB_API_VERSION >= 0x01000106
+    libusb_set_option(ctx, LIBUSB_OPTION_LOG_LEVEL, loglevel);
+#else
+    libusb_set_debug(ctx, loglevel);
+#endif
+    libusb_set_pollfd_notifiers(ctx, usb_host_add_fd,
+                                usb_host_del_fd,
+                                ctx);
+    poll = libusb_get_pollfds(ctx);
+    if (poll) {
+        int i;
+        for (i = 0; poll[i] != NULL; i++) {
+            usb_host_add_fd(poll[i]->fd, poll[i]->events, ctx);
+        }
+    }
+    free(poll);
+    return 0;
+}
+#endif
 
 static int usb_host_get_port(libusb_device *dev, char *port, size_t len)
 {
@@ -1184,10 +1221,6 @@ static void usb_host_realize(USBDevice *udev, Error **errp)
     libusb_device *ldev;
     int rc;
 
-    if (usb_host_init() != 0) {
-        error_setg(errp, "failed to init libusb");
-        return;
-    }
     if (s->match.vendor_id > 0xffff) {
         error_setg(errp, "vendorid out of range");
         return;
@@ -1208,8 +1241,27 @@ static void usb_host_realize(USBDevice *udev, Error **errp)
     QTAILQ_INIT(&s->isorings);
     s->hostfd = -1;
 
+#if LIBUSB_API_VERSION >= 0x0100010A && !defined(CONFIG_WIN32)
+    if (s->hostfd_prop >= 0) {
+        if (usb_host_init_no_discovery() != 0) {
+            error_setg(errp, "failed to init libusb (no-discovery)");
+            return;
+        }
+        s->needs_autoscan = false;
+        rc = usb_host_open(s, NULL, s->hostfd_prop);
+        if (rc < 0) {
+            error_setg(errp, "failed to open host usb device from fd %d",
+                       s->hostfd_prop);
+            return;
+        }
+    } else
+#endif
 #if LIBUSB_API_VERSION >= 0x01000107 && !defined(CONFIG_WIN32)
     if (s->hostdevice) {
+        if (usb_host_init() != 0) {
+            error_setg(errp, "failed to init libusb");
+            return;
+        }
         int fd;
         s->needs_autoscan = false;
         fd = qemu_open(s->hostdevice, O_RDWR, errp);
@@ -1227,6 +1279,10 @@ static void usb_host_realize(USBDevice *udev, Error **errp)
         !s->match.vendor_id &&
         !s->match.product_id &&
         !s->match.port) {
+        if (usb_host_init() != 0) {
+            error_setg(errp, "failed to init libusb");
+            return;
+        }
         s->needs_autoscan = false;
         ldev = usb_host_find_ref(s->match.bus_num,
                                  s->match.addr);
@@ -1243,6 +1299,10 @@ static void usb_host_realize(USBDevice *udev, Error **errp)
             return;
         }
     } else {
+        if (usb_host_init() != 0) {
+            error_setg(errp, "failed to init libusb");
+            return;
+        }
         s->needs_autoscan = true;
         QTAILQ_INSERT_TAIL(&hostdevs, s, next);
         usb_host_auto_check(NULL);
@@ -1766,6 +1826,7 @@ static const Property usb_host_dev_properties[] = {
     DEFINE_PROP_UINT32("productid", USBHostDevice, match.product_id, 0),
 #if LIBUSB_API_VERSION >= 0x01000107
     DEFINE_PROP_STRING("hostdevice", USBHostDevice, hostdevice),
+    DEFINE_PROP_INT32("hostfd", USBHostDevice, hostfd_prop, -1),
 #endif
     DEFINE_PROP_UINT32("isobufs",  USBHostDevice, iso_urb_count,    4),
     DEFINE_PROP_UINT32("isobsize", USBHostDevice, iso_urb_frames,   32),

@@ -85,6 +85,42 @@
 #define BD_IOC (1 << 31)
 #define BD_BUP (1 << 30)
 
+/*
+ * When a guest hits Pause in its media player, some drivers (Windows XP's
+ * ac97intc among them) simply stop queuing fresh buffers but leave the DMA
+ * engine running — the ring then cycles through stale audio forever,
+ * which is audible as an N-ms loop of whatever was playing at pause.
+ *
+ * Real hardware hides this because the analog output amplifier is gated
+ * by the master/PCM-out mute bits; here we have no analog stage, so the
+ * stale loop goes straight to the host audio backend.
+ *
+ * Detection: as each buffer descriptor is fetched for playback we hash
+ * the first N bytes of its DMA buffer and compare against the hash from
+ * the previous time that BD index was used.  An active guest writes fresh
+ * PCM into those buffers, so hashes change; an idle guest leaves the
+ * memory untouched and every BD's hash matches its predecessor.  After
+ * AC97_STALE_BD_THRESHOLD consecutive "unchanged" BDs we start emitting
+ * zeros instead of the stale loop.
+ *
+ * This is alignment-independent (unlike comparing consecutive tmpbufs)
+ * and doesn't care how the guest drives LVI — making it robust against
+ * drivers that write LVI as a keepalive during pause.
+ */
+#define AC97_STALE_BD_THRESHOLD       2    /* consecutive unchanged BDs */
+#define AC97_HASH_SAMPLE_BYTES      256    /* bytes of each BD to hash */
+#define AC97_DEBUG_PAUSE_DETECT       0    /* set 1 to trace */
+
+#if AC97_DEBUG_PAUSE_DETECT && defined(__ANDROID__)
+#include <android/log.h>
+#define AC97_TRACE(...) \
+    __android_log_print(ANDROID_LOG_INFO, "ac97", __VA_ARGS__)
+#elif AC97_DEBUG_PAUSE_DETECT
+#define AC97_TRACE(...) AUD_log("ac97", __VA_ARGS__)
+#else
+#define AC97_TRACE(...) do { } while (0)
+#endif
+
 #define TYPE_AC97 "AC97"
 OBJECT_DECLARE_SIMPLE_TYPE(AC97LinkState, AC97)
 
@@ -132,6 +168,13 @@ struct AC97LinkState {
     int invalid_freq[3];
     uint8_t silence[128];
     int bup_flag;
+    /*
+     * Pause-loop detection (see AC97_STALE_BD_THRESHOLD).  One entry per
+     * BD index; holds a hash of AC97_HASH_SAMPLE_BYTES of the BD's DMA
+     * buffer the last time that BD was played out.
+     */
+    uint32_t po_bd_hash[32];
+    unsigned po_stale_bds;
     MemoryRegion io_nam;
     MemoryRegion io_nabm;
 };
@@ -181,6 +224,26 @@ static void po_callback(void *opaque, int free);
 static void pi_callback(void *opaque, int avail);
 static void mc_callback(void *opaque, int avail);
 
+/* FNV-1a over a region of guest memory.  Used only for heuristic
+ * loop-detection — hash collisions are harmless (just a false negative). */
+static uint32_t ac97_hash_bd_content(AC97LinkState *s,
+                                     uint32_t addr, uint32_t byte_len)
+{
+    uint8_t buf[AC97_HASH_SAMPLE_BYTES];
+    uint32_t sample_len = MIN(byte_len, (uint32_t)sizeof(buf));
+    uint32_t h = 0x811c9dc5u;
+    uint32_t i;
+
+    if (!sample_len) {
+        return 0;
+    }
+    pci_dma_read(&s->dev, addr, buf, sample_len);
+    for (i = 0; i < sample_len; i++) {
+        h = (h ^ buf[i]) * 0x01000193u;
+    }
+    return h;
+}
+
 static void fetch_bd(AC97LinkState *s, AC97BusMasterRegs *r)
 {
     uint8_t b[8];
@@ -193,6 +256,26 @@ static void fetch_bd(AC97LinkState *s, AC97BusMasterRegs *r)
     dolog("bd %2d addr=0x%x ctl=0x%06x len=0x%x(%d bytes)\n",
           r->civ, r->bd.addr, r->bd.ctl_len >> 16,
           r->bd.ctl_len & 0xffff, (r->bd.ctl_len & 0xffff) << 1);
+
+    /* Pause-loop detection: for the playback voice, hash this BD's DMA
+     * buffer and compare against the hash from the last time we played
+     * the same BD index.  Consecutive matches mean the guest isn't
+     * writing fresh PCM — i.e. the ring is stale. */
+    if (r == &s->bm_regs[PO_INDEX] && r->picb) {
+        uint32_t len = (uint32_t)r->picb << 1;
+        uint32_t h = ac97_hash_bd_content(s, r->bd.addr, len);
+        unsigned idx = r->civ & 31;
+
+        if (h == s->po_bd_hash[idx]) {
+            s->po_stale_bds++;
+        } else {
+            s->po_stale_bds = 0;
+        }
+        s->po_bd_hash[idx] = h;
+
+        AC97_TRACE("fetch_bd po civ=%u addr=0x%x len=%u hash=0x%x stale=%u",
+                   r->civ, r->bd.addr, len, h, s->po_stale_bds);
+    }
 }
 
 static void update_sr(AC97LinkState *s, AC97BusMasterRegs *r, uint32_t new_sr)
@@ -276,6 +359,13 @@ static void reset_bm_regs(AC97LinkState *s, AC97BusMasterRegs *r)
 
     voice_set_active(s, r - s->bm_regs, 0);
     memset(s->silence, 0, sizeof(s->silence));
+
+    /* Clearing the ring means any future BD contents will be fresh — reset
+     * the pause-loop detector so we don't carry stale state across a reset. */
+    if (r == &s->bm_regs[PO_INDEX]) {
+        memset(s->po_bd_hash, 0, sizeof(s->po_bd_hash));
+        s->po_stale_bds = 0;
+    }
 }
 
 static void mixer_store(AC97LinkState *s, uint32_t i, uint16_t v)
@@ -795,6 +885,8 @@ static void nabm_writeb(void *opaque, uint32_t addr, uint32_t val)
             fetch_bd(s, r);
         }
         r->lvi = val % 32;
+        AC97_TRACE("LVI[%d] <- 0x%x civ=%u stale_bds=%u",
+                   GET_BM(addr), val, r->civ, s->po_stale_bds);
         dolog("LVI[%d] <- 0x%x\n", GET_BM(addr), val);
         break;
     case PI_CR:
@@ -891,6 +983,15 @@ static int write_audio(AC97LinkState *s, AC97BusMasterRegs *r,
     uint32_t temp = r->picb << 1;
     uint32_t written = 0;
     int to_copy = 0;
+    /*
+     * Pause-loop detection: if the same PCM content has been flowing through
+     * the ring for several BDs in a row, the guest is idle and we substitute
+     * silence.  State (CIV/PICB/LVI) keeps advancing normally so that when
+     * the guest eventually writes fresh PCM, the next fetch_bd's hash
+     * mismatches, po_stale_bds drops to 0, and audio resumes.
+     */
+    bool emit_silence = s->po_stale_bds >= AC97_STALE_BD_THRESHOLD;
+
     temp = MIN(temp, max);
 
     if (!temp) {
@@ -901,7 +1002,11 @@ static int write_audio(AC97LinkState *s, AC97BusMasterRegs *r,
     while (temp) {
         int copied;
         to_copy = MIN(temp, sizeof(tmpbuf));
-        pci_dma_read(&s->dev, addr, tmpbuf, to_copy);
+        if (emit_silence) {
+            memset(tmpbuf, 0, to_copy);
+        } else {
+            pci_dma_read(&s->dev, addr, tmpbuf, to_copy);
+        }
         copied = AUD_write(s->voice_po, tmpbuf, to_copy);
         dolog("write_audio max=%x to_copy=%x copied=%x\n",
               max, to_copy, copied);
@@ -1012,6 +1117,7 @@ static void transfer_audio(AC97LinkState *s, int index, int elapsed)
         }
         return;
     }
+
 
     while ((elapsed >> 1) && !stop) {
         int temp;
